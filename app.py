@@ -1,7 +1,7 @@
 # app.py — Streamlit NBA projections using BALLDONTLIE (GOAT tier)
-# ---------------------------------------------------------------
+# ----------------------------------------------------------------
 # 🔑 PASTE YOUR KEY HERE (quotes required)
-API_KEY_DEFAULT = "PASTE_KEY_HERE"
+API_KEY_DEFAULT = "7f4db7a9-c34e-478d-a799-fef77b9d1f78"
 
 import os
 import math
@@ -12,32 +12,31 @@ import streamlit as st
 
 st.set_page_config(page_title="NBA Projections — BALLDONTLIE", page_icon="🧮", layout="wide")
 
-# ------------------------- Config / Key Resolution -------------------------
+# ============================ Key Resolution =============================
 def resolve_api_key():
-    # Precedence: hardcoded (this file) > secrets > environment > sidebar field
-    # (You can still override in the sidebar if you want.)
+    # Precedence: hardcoded (this file) > Streamlit secrets > env var > sidebar field
     hardcoded = (API_KEY_DEFAULT or "").strip()
-    if hardcoded and hardcoded != "7f4db7a9-c34e-478d-a799-fef77b9d1f78":
+    if hardcoded and hardcoded != "PASTE_KEY_HERE":
         return hardcoded
-
     secret = (st.secrets.get("BALLDONTLIE_API_KEY", "") or "").strip()
     if secret:
         return secret
-
     env = (os.getenv("BALLDONTLIE_API_KEY", "") or "").strip()
     if env:
         return env
-
-    # Optional: sidebar input override
-    return (st.sidebar.text_input("BALLDONTLIE API Key (optional)", value="", type="password").strip())
+    # Optional manual override in the sidebar (hidden input)
+    return st.sidebar.text_input("BALLDONTLIE API Key (optional)", value="", type="password").strip()
 
 API_KEY = resolve_api_key()
-BASE = "https://api.balldontlie.io/nba/v1"   # ✅ NBA namespace
+BASE = "https://api.balldontlie.io/nba/v1"   # ✅ NBA namespace (required)
 HEADERS = {"Authorization": API_KEY} if API_KEY else {}
 
-# ----------------------------- HTTP Utilities ------------------------------
-def http_get(path: str, params: dict | list | None = None, timeout: int = 20):
-    """GET wrapper that shows readable errors and prevents JSONDecodeError."""
+# ============================ HTTP Utilities =============================
+def http_get(path: str, params: dict | list | None = None, timeout: int = 25):
+    """
+    GET wrapper with readable errors and JSON safety (prevents JSONDecodeError).
+    Shows a short response preview when status != 200.
+    """
     if not API_KEY:
         st.error("No API key detected. Paste it at the top of app.py or add to Secrets/Env/Sidebar.")
         st.stop()
@@ -45,47 +44,50 @@ def http_get(path: str, params: dict | list | None = None, timeout: int = 20):
     url = f"{BASE}{path}"
     r = requests.get(url, headers=HEADERS, params=params or {}, timeout=timeout)
 
-    # Helpful diagnostics when something goes wrong
     if r.status_code != 200:
-        snippet = (r.text or "")[:400]
-        st.error(f"HTTP {r.status_code} on {path}\n\nResponse preview:\n{snippet}")
+        preview = (r.text or "")[:400]
+        st.error(f"HTTP {r.status_code} on {path}\n\nURL: {url}\nParams: {params}\n\nResponse preview:\n{preview}")
         st.stop()
 
     try:
         return r.json()
     except ValueError:
-        snippet = (r.text or "")[:400]
-        st.error(f"Non-JSON response from {path}. Check URL/params/tier.\n\nResponse preview:\n{snippet}")
+        preview = (r.text or "")[:400]
+        st.error(f"Non-JSON response from {path}\n\nURL: {url}\nParams: {params}\n\nPreview:\n{preview}")
         st.stop()
 
 def list_paginated(path: str, params: dict | list | None = None, max_pages: int = 20):
-    """Cursor-based pagination helper."""
+    """
+    Cursor-based pagination helper. Returns concatenated 'data' arrays.
+    """
     params = dict(params or {})
     params.setdefault("per_page", 100)
-    data_all, cursor = [], None
+    rows, cursor = [], None
     for _ in range(max_pages):
         p = dict(params)
         if cursor:
             p["cursor"] = cursor
         payload = http_get(path, p)
-        data_all.extend(payload.get("data", []))
+        rows.extend(payload.get("data", []))
         cursor = (payload.get("meta") or {}).get("next_cursor")
         if not cursor:
             break
-    return data_all
+    return rows
 
-# ------------------------------ API Helpers --------------------------------
+# ============================== API Helpers ==============================
 @st.cache_data(ttl=3600)
 def list_active_players():
-    return list_paginated("/players/active")
+    # ✅ Correct route: /players?active=true (NOT /players/active)
+    return list_paginated("/players", {"active": "true"})
 
 @st.cache_data(ttl=900)
 def games_on_date(date_str: str):
     return list_paginated("/games", {"dates[]": date_str})
 
 @st.cache_data(ttl=600)
-def season_averages(player_ids: list[int], season: int, season_type="regular", category="general", type_="base"):
-    # Build repeated params via tuples so duplicates survive
+def season_averages(player_ids: list[int], season: int,
+                    season_type="regular", category="general", type_="base"):
+    # season averages lives under /season_averages/<category>
     q = [("season", season), ("season_type", season_type), ("type", type_)]
     for pid in player_ids:
         q.append(("player_ids[]", pid))
@@ -94,7 +96,9 @@ def season_averages(player_ids: list[int], season: int, season_type="regular", c
 
 @st.cache_data(ttl=600)
 def recent_stats(player_id: int, start_date: str, end_date: str):
-    """Per-game stat lines between dates via /stats with multiple dates[] params."""
+    """
+    Per-game stat lines between dates via /stats with repeated dates[] params.
+    """
     d0 = dt.datetime.strptime(start_date, "%Y-%m-%d").date()
     d1 = dt.datetime.strptime(end_date, "%Y-%m-%d").date()
     dates = []
@@ -113,7 +117,7 @@ def recent_stats(player_id: int, start_date: str, end_date: str):
         rows.extend(payload.get("data", []))
     return rows
 
-# ----------------------------- Math / Projections --------------------------
+# ========================= Math / Projections ============================
 def recent_avgs(rows: list[dict]) -> dict | None:
     if not rows:
         return None
@@ -123,7 +127,7 @@ def recent_avgs(rows: list[dict]) -> dict | None:
             df[col] = 0
     df["min"] = pd.to_numeric(df["min"], errors="coerce")
     return {
-        "GP": len(df),
+        "GP":  len(df),
         "PTS": df["pts"].mean(),
         "AST": df["ast"].mean(),
         "REB": df["reb"].mean(),
@@ -152,11 +156,11 @@ def r2(v):
     except Exception:
         return None
 
-# --------------------------------- UI --------------------------------------
+# ================================ UI =====================================
 st.title("NBA Projections — BALLDONTLIE")
 st.caption("Projections = blend of season averages and recent form (last N days). Uses `/nba/v1` endpoints.")
 
-# Quick diagnostics (you can comment these out)
+# Quick diagnostics in sidebar (you can comment these out)
 st.sidebar.code(f"API Base: {BASE}\nKey length: {len(API_KEY) if API_KEY else 0}")
 
 col1, col2, col3 = st.columns([2,1,1])
@@ -176,14 +180,14 @@ date_choice = st.selectbox(
 )
 
 if not API_KEY:
-    st.warning("No API key found. Paste it at the very top of this file (API_KEY_DEFAULT) or in the sidebar.")
+    st.warning("No API key found. Paste it at the very top of this file (API_KEY_DEFAULT) or in Secrets/Env/Sidebar.")
     st.stop()
 
-# Resolve players
+# -------- Resolve players (uses /players?active=true) --------
 players = list_active_players()
 pdf = pd.json_normalize(players)
 if pdf.empty:
-    st.error("Could not load active players. Check key/tier.")
+    st.error("Could not load active players. Check key/tier or base URL.")
     st.stop()
 
 pdf["full_name"] = pdf["first_name"] + " " + pdf["last_name"]
@@ -201,7 +205,7 @@ if sel_row is not None:
     team_id = int(sel_row["team.id"])
     st.subheader(f"{sel_row['full_name']}  (ID {pid})")
 
-    # Find next game on chosen date (if any)
+    # Next game on chosen date (if any)
     g_list = games_on_date(date_choice)
     next_game = None
     for g in g_list:
@@ -209,10 +213,10 @@ if sel_row is not None:
             next_game = g
             break
     if next_game is None:
-        st.info(f"No game for {sel_row['team.full_name']} on {date_choice}. Projections still shown.")
+        st.info(f"No game for {sel_row['team.full_name']} on {date_choice}. Projections still shown from averages.")
 
-    # Season + recent
-    season = today.year  # adjust if API uses league-year concept
+    # Season averages (general/base)
+    season = today.year  # adjust if the API expects league-year pattern
     seas = season_averages([pid], season, season_type="regular", category="general", type_="base")
     srow = seas[0] if seas else {}
     season_avg = {
@@ -223,11 +227,13 @@ if sel_row is not None:
         "MIN": srow.get("min"),
     }
 
+    # Recent window
     start = (today - dt.timedelta(days=days_back)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
     rec_rows = recent_stats(pid, start, end)
     recent_avg = recent_avgs(rec_rows) or {}
 
+    # Projection
     proj = blend_projection(season_avg, recent_avg, s_w=season_weight, r_w=recent_weight)
 
     left, right = st.columns(2)
@@ -262,4 +268,4 @@ if sel_row is not None:
 else:
     st.info("Type a player’s full name to generate a projection.")
 
-st.caption("Tip: If you ever see a JSONDecodeError, turn on the sidebar diagnostics and confirm the base URL is /nba/v1 and your key length looks right.")
+st.caption("If you hit a 401, verify: (1) base URL includes /nba/v1, (2) header is Authorization: <your_key>, (3) no hidden whitespace in the key.")
