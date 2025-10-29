@@ -1,230 +1,265 @@
-import streamlit as st
+# app.py — Streamlit NBA projections using BALLDONTLIE (GOAT tier)
+# ---------------------------------------------------------------
+# 🔑 PASTE YOUR KEY HERE (quotes required)
+API_KEY_DEFAULT = "PASTE_KEY_HERE"
+
+import os
+import math
+import datetime as dt
 import requests
 import pandas as pd
-import random
-from datetime import datetime, timedelta
+import streamlit as st
 
-# ----------------------------- #
-# APP CONFIG
-# ----------------------------- #
-st.set_page_config(
-    page_title="NBA Dashboard",
-    page_icon="🏀",
-    layout="wide",
-    initial_sidebar_state="expanded",
+st.set_page_config(page_title="NBA Projections — BALLDONTLIE", page_icon="🧮", layout="wide")
+
+# ------------------------- Config / Key Resolution -------------------------
+def resolve_api_key():
+    # Precedence: hardcoded (this file) > secrets > environment > sidebar field
+    # (You can still override in the sidebar if you want.)
+    hardcoded = (API_KEY_DEFAULT or "").strip()
+    if hardcoded and hardcoded != "7f4db7a9-c34e-478d-a799-fef77b9d1f78":
+        return hardcoded
+
+    secret = (st.secrets.get("BALLDONTLIE_API_KEY", "") or "").strip()
+    if secret:
+        return secret
+
+    env = (os.getenv("BALLDONTLIE_API_KEY", "") or "").strip()
+    if env:
+        return env
+
+    # Optional: sidebar input override
+    return (st.sidebar.text_input("BALLDONTLIE API Key (optional)", value="", type="password").strip())
+
+API_KEY = resolve_api_key()
+BASE = "https://api.balldontlie.io/nba/v1"   # ✅ NBA namespace
+HEADERS = {"Authorization": API_KEY} if API_KEY else {}
+
+# ----------------------------- HTTP Utilities ------------------------------
+def http_get(path: str, params: dict | list | None = None, timeout: int = 20):
+    """GET wrapper that shows readable errors and prevents JSONDecodeError."""
+    if not API_KEY:
+        st.error("No API key detected. Paste it at the top of app.py or add to Secrets/Env/Sidebar.")
+        st.stop()
+
+    url = f"{BASE}{path}"
+    r = requests.get(url, headers=HEADERS, params=params or {}, timeout=timeout)
+
+    # Helpful diagnostics when something goes wrong
+    if r.status_code != 200:
+        snippet = (r.text or "")[:400]
+        st.error(f"HTTP {r.status_code} on {path}\n\nResponse preview:\n{snippet}")
+        st.stop()
+
+    try:
+        return r.json()
+    except ValueError:
+        snippet = (r.text or "")[:400]
+        st.error(f"Non-JSON response from {path}. Check URL/params/tier.\n\nResponse preview:\n{snippet}")
+        st.stop()
+
+def list_paginated(path: str, params: dict | list | None = None, max_pages: int = 20):
+    """Cursor-based pagination helper."""
+    params = dict(params or {})
+    params.setdefault("per_page", 100)
+    data_all, cursor = [], None
+    for _ in range(max_pages):
+        p = dict(params)
+        if cursor:
+            p["cursor"] = cursor
+        payload = http_get(path, p)
+        data_all.extend(payload.get("data", []))
+        cursor = (payload.get("meta") or {}).get("next_cursor")
+        if not cursor:
+            break
+    return data_all
+
+# ------------------------------ API Helpers --------------------------------
+@st.cache_data(ttl=3600)
+def list_active_players():
+    return list_paginated("/players/active")
+
+@st.cache_data(ttl=900)
+def games_on_date(date_str: str):
+    return list_paginated("/games", {"dates[]": date_str})
+
+@st.cache_data(ttl=600)
+def season_averages(player_ids: list[int], season: int, season_type="regular", category="general", type_="base"):
+    # Build repeated params via tuples so duplicates survive
+    q = [("season", season), ("season_type", season_type), ("type", type_)]
+    for pid in player_ids:
+        q.append(("player_ids[]", pid))
+    payload = http_get(f"/season_averages/{category}", params=dict(q))
+    return payload.get("data", [])
+
+@st.cache_data(ttl=600)
+def recent_stats(player_id: int, start_date: str, end_date: str):
+    """Per-game stat lines between dates via /stats with multiple dates[] params."""
+    d0 = dt.datetime.strptime(start_date, "%Y-%m-%d").date()
+    d1 = dt.datetime.strptime(end_date, "%Y-%m-%d").date()
+    dates = []
+    cur = d0
+    while cur <= d1:
+        dates.append(cur.strftime("%Y-%m-%d"))
+        cur += dt.timedelta(days=1)
+
+    rows = []
+    for i in range(0, len(dates), 10):
+        chunk = dates[i:i+10]
+        q = [("player_ids[]", player_id)]
+        for d in chunk:
+            q.append(("dates[]", d))
+        payload = http_get("/stats", params=dict(q))
+        rows.extend(payload.get("data", []))
+    return rows
+
+# ----------------------------- Math / Projections --------------------------
+def recent_avgs(rows: list[dict]) -> dict | None:
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    for col in ["pts", "ast", "reb", "fg3m", "min"]:
+        if col not in df.columns:
+            df[col] = 0
+    df["min"] = pd.to_numeric(df["min"], errors="coerce")
+    return {
+        "GP": len(df),
+        "PTS": df["pts"].mean(),
+        "AST": df["ast"].mean(),
+        "REB": df["reb"].mean(),
+        "3PM": df["fg3m"].mean(),
+        "MIN": df["min"].mean(skipna=True),
+    }
+
+def blend_projection(season_avg: dict | None, recent_avg: dict | None, s_w=0.4, r_w=0.6):
+    out = {}
+    for k in ["PTS", "AST", "REB", "3PM"]:
+        s = (season_avg or {}).get(k, math.nan)
+        r = (recent_avg or {}).get(k, math.nan)
+        if not math.isnan(s) and not math.isnan(r):
+            out[k] = s_w * s + r_w * r
+        elif not math.isnan(r):
+            out[k] = r
+        elif not math.isnan(s):
+            out[k] = s
+        else:
+            out[k] = math.nan
+    return out
+
+def r2(v):
+    try:
+        return round(float(v), 2)
+    except Exception:
+        return None
+
+# --------------------------------- UI --------------------------------------
+st.title("NBA Projections — BALLDONTLIE")
+st.caption("Projections = blend of season averages and recent form (last N days). Uses `/nba/v1` endpoints.")
+
+# Quick diagnostics (you can comment these out)
+st.sidebar.code(f"API Base: {BASE}\nKey length: {len(API_KEY) if API_KEY else 0}")
+
+col1, col2, col3 = st.columns([2,1,1])
+with col1:
+    player_query = st.text_input("Player name", placeholder="e.g., Stephen Curry")
+with col2:
+    days_back = st.slider("Recent window (days)", 7, 60, 30)
+with col3:
+    season_weight = st.slider("Season weight", 0.0, 1.0, 0.4, 0.05)
+recent_weight = 1 - season_weight
+
+today = dt.date.today()
+tomorrow = today + dt.timedelta(days=1)
+date_choice = st.selectbox(
+    "Upcoming date",
+    [tomorrow.strftime("%Y-%m-%d"), (tomorrow + dt.timedelta(days=1)).strftime("%Y-%m-%d")]
 )
 
-# Custom theme (Midnight Blue + Gold)
-st.markdown("""
-    <style>
-        body, .stApp {
-            background-color: #0B132B;
-            color: #F5C518;
-        }
-        h1, h2, h3, h4 {
-            color: #F5C518;
-            text-align: center;
-        }
-        .player-card {
-            border-radius: 12px;
-            background-color: #1C2541;
-            color: #F5C518;
-            padding: 20px;
-            text-align: center;
-            box-shadow: 0px 0px 14px rgba(245,197,24,0.35);
-        }
-        .stat-bar {
-            background: linear-gradient(90deg, #F5C518 0%, #FFCC33 100%);
-            height: 10px;
-            border-radius: 5px;
-        }
-        .projection {
-            font-size: 1.2rem;
-            font-weight: bold;
-            color: #FFD700;
-        }
-        .confidence {
-            font-size: 0.9rem;
-            color: #87CEEB;
-        }
-        .bet-take {
-            border-left: 4px solid #FFD700;
-            padding-left: 10px;
-            margin-bottom: 10px;
-        }
-    </style>
-""", unsafe_allow_html=True)
+if not API_KEY:
+    st.warning("No API key found. Paste it at the very top of this file (API_KEY_DEFAULT) or in the sidebar.")
+    st.stop()
 
-# ----------------------------- #
-# API CONFIG
-# ----------------------------- #
-API_KEY = st.secrets.get("BALLDONTLIE_KEY", "")
-HEADERS = {"Authorization": API_KEY} if API_KEY else {}
-BASE_URL = "https://api.balldontlie.io/v1"
+# Resolve players
+players = list_active_players()
+pdf = pd.json_normalize(players)
+if pdf.empty:
+    st.error("Could not load active players. Check key/tier.")
+    st.stop()
 
-# ----------------------------- #
-# CACHED FETCHERS
-# ----------------------------- #
-@st.cache_data(ttl=3600)
-def get_teams():
-    r = requests.get(f"{BASE_URL}/teams", headers=HEADERS)
-    return r.json().get("data", [])
+pdf["full_name"] = pdf["first_name"] + " " + pdf["last_name"]
 
-@st.cache_data(ttl=3600)
-def get_players_by_team(team_id):
-    r = requests.get(f"{BASE_URL}/players?team_ids[]={team_id}&per_page=100", headers=HEADERS)
-    return r.json().get("data", [])
+sel_row = None
+if player_query:
+    m = pdf[pdf["full_name"].str.contains(player_query, case=False, na=False)]
+    if not m.empty:
+        sel_row = m.iloc[0]
+    else:
+        st.warning("No active player matched that name.")
 
-@st.cache_data(ttl=3600)
-def get_player_stats(player_id):
-    # Try season averages
-    res = requests.get(f"{BASE_URL}/season_averages?player_ids[]={player_id}", headers=HEADERS)
-    data = res.json().get("data", [])
-    if data:
-        s = data[0]
-        s["source"] = "Season Averages"
-        return s
+if sel_row is not None:
+    pid = int(sel_row["id"])
+    team_id = int(sel_row["team.id"])
+    st.subheader(f"{sel_row['full_name']}  (ID {pid})")
 
-    # Fallback to last 10 games
-    res = requests.get(f"{BASE_URL}/stats?player_ids[]={player_id}&per_page=10", headers=HEADERS)
-    games = res.json().get("data", [])
-    if games:
-        df = pd.DataFrame(games)
-        stats = {
-            "pts": df["pts"].mean(),
-            "reb": df["reb"].mean(),
-            "ast": df["ast"].mean(),
-            "stl": df["stl"].mean(),
-            "blk": df["blk"].mean(),
-            "source": "Last 10 Games"
-        }
-        return stats
-    return None
+    # Find next game on chosen date (if any)
+    g_list = games_on_date(date_choice)
+    next_game = None
+    for g in g_list:
+        if g["home_team"]["id"] == team_id or g["visitor_team"]["id"] == team_id:
+            next_game = g
+            break
+    if next_game is None:
+        st.info(f"No game for {sel_row['team.full_name']} on {date_choice}. Projections still shown.")
 
-# ----------------------------- #
-# SIMPLE PROJECTION MODEL
-# ----------------------------- #
-def project_player(stats):
-    if not stats:
-        return None
-    # Adjust small random variation and scaling for opponent defense
-    variation = random.uniform(0.9, 1.1)
-    projected = {
-        "pts": round(stats["pts"] * variation, 1),
-        "reb": round(stats["reb"] * variation, 1),
-        "ast": round(stats["ast"] * variation, 1),
-        "stl": round(stats["stl"] * variation, 1),
-        "blk": round(stats["blk"] * variation, 1),
-        "confidence": random.randint(6, 10)
+    # Season + recent
+    season = today.year  # adjust if API uses league-year concept
+    seas = season_averages([pid], season, season_type="regular", category="general", type_="base")
+    srow = seas[0] if seas else {}
+    season_avg = {
+        "PTS": srow.get("pts"),
+        "AST": srow.get("ast"),
+        "REB": srow.get("reb"),
+        "3PM": srow.get("fg3m"),
+        "MIN": srow.get("min"),
     }
-    return projected
 
-# ----------------------------- #
-# SIDEBAR NAVIGATION
-# ----------------------------- #
-st.sidebar.title("🏀 NBA Dashboard")
-menu = st.sidebar.radio("Navigate", ["Home", "Player Performance", "Favorites", "Expert Picks"])
+    start = (today - dt.timedelta(days=days_back)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+    rec_rows = recent_stats(pid, start, end)
+    recent_avg = recent_avgs(rec_rows) or {}
 
-# ----------------------------- #
-# HOME PAGE
-# ----------------------------- #
-if menu == "Home":
-    st.title("🏀 NBA Daily Insights")
-    st.markdown("### Top 10 Player Projections (Auto-updating Daily at 9AM)")
+    proj = blend_projection(season_avg, recent_avg, s_w=season_weight, r_w=recent_weight)
 
-    st.info("This section will show the top 10 players with the highest projection confidence based on recent form and opponent defense.")
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Season Averages**")
+        st.metric("PTS", r2(season_avg.get("PTS")))
+        st.metric("AST", r2(season_avg.get("AST")))
+        st.metric("REB", r2(season_avg.get("REB")))
+        st.metric("3PM", r2(season_avg.get("3PM")))
+    with right:
+        st.markdown(f"**Recent ({days_back} days)**")
+        st.metric("PTS", r2(recent_avg.get("PTS")))
+        st.metric("AST", r2(recent_avg.get("AST")))
+        st.metric("REB", r2(recent_avg.get("REB")))
+        st.metric("3PM", r2(recent_avg.get("3PM")))
 
-# ----------------------------- #
-# PLAYER PERFORMANCE PAGE
-# ----------------------------- #
-elif menu == "Player Performance":
-    st.title("📊 Player Performance & Projections")
+    st.markdown(f"### Projection for {date_choice}")
+    st.dataframe(pd.DataFrame([{
+        "Player": sel_row["full_name"],
+        "Team": sel_row["team.abbreviation"],
+        "Opponent": (
+            next_game["visitor_team"]["abbreviation"]
+            if (next_game and next_game["home_team"]["id"] == team_id)
+            else (next_game["home_team"]["abbreviation"] if next_game else None)
+        ),
+        "PTS_proj": r2(proj["PTS"]),
+        "AST_proj": r2(proj["AST"]),
+        "REB_proj": r2(proj["REB"]),
+        "3PM_proj": r2(proj["3PM"]),
+        "Blend": f"{season_weight:.2f} season + {recent_weight:.2f} recent"
+    }]))
+else:
+    st.info("Type a player’s full name to generate a projection.")
 
-    teams = get_teams()
-    team_dict = {t["full_name"]: t["id"] for t in teams}
-
-    team_choice = st.selectbox("Select a Team:", [""] + list(team_dict.keys()))
-
-    if team_choice:
-        team_id = team_dict[team_choice]
-        players = get_players_by_team(team_id)
-        player_dict = {f"{p['first_name']} {p['last_name']}": p["id"] for p in players}
-
-        player_choice = st.selectbox("Select a Player:", [""] + list(player_dict.keys()))
-
-        if player_choice:
-            player_id = player_dict[player_choice]
-            with st.spinner("Fetching stats..."):
-                stats = get_player_stats(player_id)
-
-            if stats:
-                col1, col2, col3 = st.columns([1, 2, 1])
-                with col2:
-                    st.markdown(f"""
-                        <div class="player-card">
-                            <h3>{player_choice}</h3>
-                            <p><em>{stats['source']}</em></p>
-                            <p>PTS: {stats['pts']:.1f}</p>
-                            <div class="stat-bar" style="width:{min(stats['pts']*4,100)}%"></div>
-                            <p>REB: {stats['reb']:.1f}</p>
-                            <div class="stat-bar" style="width:{min(stats['reb']*10,100)}%"></div>
-                            <p>AST: {stats['ast']:.1f}</p>
-                            <div class="stat-bar" style="width:{min(stats['ast']*10,100)}%"></div>
-                            <p>STL: {stats['stl']:.1f}</p>
-                            <div class="stat-bar" style="width:{min(stats['stl']*30,100)}%"></div>
-                            <p>BLK: {stats['blk']:.1f}</p>
-                            <div class="stat-bar" style="width:{min(stats['blk']*30,100)}%"></div>
-                        </div>
-                    """, unsafe_allow_html=True)
-
-                proj = project_player(stats)
-                if proj:
-                    st.markdown(f"""
-                        <div style="margin-top:20px;text-align:center;">
-                            <div class="projection">Projected: {proj['pts']} PTS | {proj['reb']} REB | {proj['ast']} AST</div>
-                            <div class="confidence">Confidence Score: {proj['confidence']}/10</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.warning("No data available for this player.")
-
-# ----------------------------- #
-# FAVORITES PAGE
-# ----------------------------- #
-elif menu == "Favorites":
-    st.title("⭐ Favorite Players")
-    st.info("Feature coming soon: Save your favorite players to view all projections together.")
-
-# ----------------------------- #
-# EXPERT PICKS PAGE
-# ----------------------------- #
-elif menu == "Expert Picks":
-    st.title("🔥 Expert Betting Insights")
-
-    st.markdown("### Trending Expert Picks from across the web")
-
-    sample_picks = [
-        {"site": "Dimers.com", "pick": "LeBron James over 24.5 points", "confidence": "High"},
-        {"site": "Action Network", "pick": "Celtics -6.5 vs Knicks", "confidence": "Medium"},
-        {"site": "BettingPros", "pick": "Luka Doncic over 8.5 assists", "confidence": "High"},
-        {"site": "ExpertPicks.com", "pick": "Giannis Antetokounmpo under 12.5 rebounds", "confidence": "Medium"},
-        {"site": "X.com", "pick": "Steph Curry over 4.5 threes", "confidence": "High"}
-    ]
-
-    for pick in sample_picks:
-        st.markdown(f"""
-        <div class="bet-take">
-            <strong>{pick['site']}</strong><br/>
-            {pick['pick']}<br/>
-            <em>Confidence: {pick['confidence']}</em>
-        </div>
-        """, unsafe_allow_html=True)
-
-# ----------------------------- #
-# FOOTER
-# ----------------------------- #
-st.markdown("""
----
-🧠 **Built by Pat Vath’s NBA Dashboard** | Powered by **BallDontLie.io**  
-Auto-updates daily at **9AM ET**
-""")
+st.caption("Tip: If you ever see a JSONDecodeError, turn on the sidebar diagnostics and confirm the base URL is /nba/v1 and your key length looks right.")
