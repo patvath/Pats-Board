@@ -18,7 +18,7 @@ st.set_page_config(page_title="NBA Projections — Single Player (BDL v2)", page
 
 # ----------------------------- Config -----------------------------
 # Use v2 base as requested
-API_BASE_DEFAULT = "https://api.balldontlie.io/v2"
+API_BASE_DEFAULT = "https://api.balldontlie.io/v1"
 
 # ------------------------- Key resolution --------------------------
 def resolve_api_key() -> str:
