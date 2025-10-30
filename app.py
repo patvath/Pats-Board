@@ -55,7 +55,7 @@ def build_headers(api_key: str) -> Dict[str, str]:
 
     Parameters
     ----------
-    api_key : str
+    api_key : 7f4db7a9-c34e-478d-a799-fef77b9d1f78
         Your BALLDONTLIE API key.
 
     Returns
